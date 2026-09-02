@@ -5,7 +5,7 @@
 官方 Thor 教程是 [OpenPi π₀.₅ on Jetson Thor](https://www.jetson-ai-lab.com/tutorials/openpi_on_thor/)（示例模型 `pi05_libero`，horizon=10）。这里在同一条链路上做了这些事：
 
 - 适配自有 TienKung EVT276 模型（`pi05_tienkung_evt276_full_hand_abs`，**action horizon=40**）
-- 支持 FP16 / FP8 / NVFP4，以及动作专家混合精度（整颗 AE 保持 FP16，或只保持进出投影 FP16）
+- 支持 FP16 / FP8 / FP8+NVFP4，以及动作专家混合精度（整颗 AE 保持 FP16，或只保持action_in/out_proj投影 FP16）
 - 用真实训练帧对比 PyTorch BF16 与 TensorRT 的延迟、cosine 和 MAE
 
 ## 流水线
@@ -16,7 +16,7 @@ JAX checkpoint  →  PyTorch (BF16)  →  ONNX (FP16 / FP8 / NVFP4)  →  Tensor
                                               与同 denoise 步数的 PyTorch BF16 对比
 ```
 
-Denoise 步数在导出 ONNX 时写死，编好的 engine 不能在运行时改圈数。
+Denoise 步数在导出 ONNX 时写死，编好的 engine 不能在运行时改去噪步数。
 
 ## 主要文件
 
