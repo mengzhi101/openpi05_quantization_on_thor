@@ -40,15 +40,15 @@ if [ -z "$ENGINE_PATH" ]; then
     ENGINE_PATH="${ENGINE_DIR}/${ONNX_BASENAME}.engine"
 fi
 
-NUM_IMAGES=3
+NUM_IMAGES=1
 IMAGE_CHANNELS=$((NUM_IMAGES * 3))
-IMAGE_SIZE1=480
-IMAGE_SIZE2=640
+IMAGE_SIZE1=224
+IMAGE_SIZE2=224
 
 MAX_SEQ_LEN=208 # Use a multiple of 16 for better TensorRT performance.
 
-STATE_DIM=36
-ACTION_DIM=36
+STATE_DIM=32
+ACTION_DIM=32
 
 mkdir -p "$(dirname "$ENGINE_PATH")"
 
@@ -64,7 +64,6 @@ echo ""
     --onnx="$ONNX_PATH" \
     --saveEngine="$ENGINE_PATH" \
     --useCudaGraph \
-    --verbose \
     --stronglyTyped \
     --separateProfileRun \
     --profilingVerbosity=detailed \

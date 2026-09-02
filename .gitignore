@@ -4,6 +4,12 @@ checkpoints/
 data/
 wandb/
 
+# TensorRT / export artifacts (keep them out of git).
+*.engine
+*.onnx
+*.safetensors
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

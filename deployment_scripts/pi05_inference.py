@@ -12,6 +12,7 @@ from openpi.policies import policy_config
 from openpi.policies.aloha_policy import make_aloha_example
 from openpi.policies.droid_policy import make_droid_example
 from openpi.policies.libero_policy import make_libero_example
+from openpi.policies.tienkung_policy import make_tienkung_example
 from openpi.training import config as _config
 
 # Configure logging to show INFO messages
@@ -28,7 +29,7 @@ def create_synthetic_example(config_name):
         print("  - Type: LIBERO")
         print(f"  - State shape: {example['observation/state'].shape}")
         print(f"  - Image shape: {example['observation/image'].shape}")
-        print(f"  - Wrist image shape: {example['observation/wrist_image'].shape}")
+        # print(f"  - Wrist image shape: {example['observation/wrist_image'].shape}")
     elif "droid" in config_name.lower():
         example = make_droid_example()
         print("  - Type: DROID")
@@ -43,6 +44,9 @@ def create_synthetic_example(config_name):
         print(f"  - Number of cameras: {len(example['images'])}")
         for cam_name, img in example["images"].items():
             print(f"  - {cam_name} shape: {img.shape}")
+    elif "tienkung" in config_name.lower():
+        example = make_tienkung_example(state_dim=34)
+        print(example["state"].shape)
     else:
         # Default to LIBERO if unknown
         print(f"  - Warning: Unknown config type '{config_name}', defaulting to LIBERO")
@@ -90,9 +94,8 @@ def run_pytorch_inference(config, checkpoint_dir, example, noise=None, num_warmu
     """Run PyTorch inference with warmup and multiple test runs."""
     print("\n--- PyTorch Inference ---")
     print("Loading policy...")
-    policy = policy_config.create_trained_policy(config, checkpoint_dir)
+    policy = policy_config.create_trained_policy(config, checkpoint_dir, trt = False)
     print("Policy loaded successfully")
-
     # Deployment-side hook: align the additive attention mask dtype with the
     # attention compute dtype before torch.compile traces sample_actions,
     # otherwise the memory-efficient SDPA kernel raises
@@ -158,18 +161,17 @@ def run_tensorrt_inference(
 ):
     """Run TensorRT inference with warmup and multiple test runs."""
     print("\n--- TensorRT Inference ---")
-
     if not os.path.exists(engine_path):
         raise FileNotFoundError(
             f"TensorRT engine not found at {engine_path}\n"
             "Please run ONNX to TensorRT conversion first:\n"
             "  bash deployment_scripts/build_engine.sh"
         )
-
+    start = time.time()
     print("Loading policy...")
-    policy = policy_config.create_trained_policy(config, checkpoint_dir)
+    policy = policy_config.create_trained_policy(config, checkpoint_dir, trt = True)
     print("Policy loaded successfully")
-
+    print("torch ready", time.time() - start)
     print("Setting up TensorRT engine...")
     from deployment_scripts.trt_model_forward import setup_pi0_tensorrt_engine
 
@@ -177,8 +179,7 @@ def run_tensorrt_inference(
         policy,
         engine_path,
     )
-    print("TensorRT engine ready")
-
+    print("TensorRT engine ready", time.time() - start)
     # Warmup runs
     print(f"\nWarming up ({num_warmup} runs)...")
     with nvtx.annotate("warmup", color="blue"):
@@ -344,7 +345,7 @@ def main():
     parser.add_argument(
         "--num-warmup",
         type=int,
-        default=3,
+        default=1,
         help="Number of warmup runs (default: 3)",
     )
     parser.add_argument(
@@ -372,7 +373,6 @@ def main():
         # Compare mode: run both and compare
         print("\n[1/4] Loading example...")
         example = load_example(config, args.use_dataset, args.sample_idx)
-
         # Generate or load golden noise for deterministic comparison
         if args.golden_noise_path:
             print(f"\n[2/4] Loading golden noise from {args.golden_noise_path}...")

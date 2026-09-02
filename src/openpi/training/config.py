@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.tienkung_policy as tienkung_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -65,6 +66,9 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Local root directory of the LeRobot dataset (for offline/local datasets). If set, this
+    # will be passed as `root` to LeRobotDatasetMetadata / LeRobotDataset.
+    data_root: str | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -352,6 +356,103 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotTienkungDataConfig(DataConfigFactory):
+    """
+    Data config for TienKung LeRobot datasets (EVT50 and EVT276 layouts).
+
+    Shared assumptions:
+      - One head camera mapped to ``base_0_rgb``; missing wrist views are zero-padded
+      - Dual-arm upper-body manipulation with optional hand / head / stand dims
+
+    Embodiment-specific knobs (set per TrainConfig):
+      - EVT50: ``image_key=observation.images.head``, state/action 16D,
+        ``delta_action_dims="7,-1,7,-1"``, ``embodiment_action_dim=16``
+      - EVT276 reduced hand: ``image_key=observation.images.camera_head``,
+        state/action 24D, ``delta_action_dims="14,-10"``, ``embodiment_action_dim=24``
+      - EVT276 full hand: same camera/action settings as reduced hand, but state 34D
+        (tokenized fully, then continuous state truncated to model ``action_dim``)
+    """
+
+    # The action key in this LeRobot v2.1 dataset is "action" (singular).
+    action_sequence_keys: Sequence[str] = ("action",)
+    image_key: str = "observation.images.head"
+    embodiment_action_dim: int = 16
+    # Comma-separated signed segment lengths accepted by make_bool_mask.
+    # A positive segment uses delta actions; a negative segment stays absolute.
+    delta_action_dims: str = "7,-1,7,-1"
+
+    # If True, train on relative (delta) actions instead of absolute joint targets.
+    # The delta is computed w.r.t. the current state: arms (7+7 dims) are converted
+    # to deltas, while hands/grippers (1+1 dims) are kept absolute. At inference time
+    # the AbsoluteActions output transform adds the state back, so the policy still
+    # returns absolute joint targets (the real-robot client needs no change).
+    # NOTE: you MUST recompute norm stats after toggling this flag.
+    use_delta_actions: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Map LeRobot dataset flat keys (with dots) to intermediate keys used by TienkungInputs.
+        # LeRobot v2 returns: observation.images.head, observation.state, action, prompt, task_index, ...
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        # output_key: flat_item_lookup_key
+                        "image": self.image_key,
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        # TienKung-specific input/output transforms.
+        data_transforms = _transforms.Group(
+            inputs=[tienkung_policy.TienkungInputs(model_type=model_config.model_type)],
+            outputs=[tienkung_policy.TienkungOutputs(action_dim=self.embodiment_action_dim)],
+        )
+
+        # Optionally convert absolute actions to relative (delta) actions.
+        # Mask segments come from ``delta_action_dims`` (e.g. EVT50 ``7,-1,7,-1``,
+        # EVT276 ``14,-10``). mask True -> delta; False -> keep absolute.
+        if self.use_delta_actions:
+            delta_dims = tuple(int(dim.strip()) for dim in self.delta_action_dims.split(","))
+            delta_action_mask = _transforms.make_bool_mask(*delta_dims)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        # Standard pi0/pi05 model transforms (tokenization, image resize, etc.).
+        model_transforms = ModelTransformFactory()(model_config)
+        model_inputs = list(model_transforms.inputs)
+        pad_index = next(
+            (
+                i
+                for i, transform in enumerate(model_inputs)
+                if isinstance(transform, _transforms.PadStatesAndActions)
+            ),
+            None,
+        )
+        if pad_index is None:
+            raise ValueError("TienKung model transforms require PadStatesAndActions")
+        model_inputs.insert(pad_index, tienkung_policy.FitStateToModelDim(model_config.action_dim))
+        model_transforms = _transforms.Group(
+            inputs=tuple(model_inputs),
+            outputs=model_transforms.outputs,
+        )
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
         )
 
 
@@ -760,6 +861,171 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    #
+    # Fine-tuning TienKung configs.
+    #
+    TrainConfig(
+        name="pi05_tienkung",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=40,
+            discrete_state_input=True,
+        ),
+        data=LeRobotTienkungDataConfig(
+            repo_id="tienkung_evt50_upper_body",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                data_root="/media/yizi-guo/mani_vla/Isaac-GR00T/dataset/wholebody/tienkung_evt50_upper_body_lerobot_v2_h40_cup_tower_prompt",
+            ),
+            # Train on relative (delta) actions: arms relative, hands absolute.
+            # Remember to recompute norm stats after changing this.
+            use_delta_actions=True,
+        ),
+        # Local cache layout from: OPENPI_DATA_HOME=/media/yizi-guo/pretrained_model
+        # + maybe_download("gs://openpi-assets/checkpoints/pi05_base/params")
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/media/yizi-guo/pretrained_model/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=5e-5,
+            decay_steps=60_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=60_000,
+        batch_size=128,
+        save_interval=4000,
+        keep_period=4000,
+        log_interval=100,
+    ),
+    TrainConfig(
+        name="pi05_tienkung_evt276_full_hand",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=40,
+            discrete_state_input=True,
+        ),
+        data=LeRobotTienkungDataConfig(
+            repo_id="evt276_move_box_to_trans_260801",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                data_root=(
+                    "/media/yizi-guo/dataset/XR-1-lerobot/"
+                    "EVT276_MOVE_BOX_TO_TRANS_260801/evt276_move_box_to_trans_260801"
+                ),
+            ),
+            image_key="observation.images.camera_head",
+            embodiment_action_dim=24,
+            delta_action_dims="14,-10",
+            use_delta_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/media/yizi-guo/pretrained_model/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=5e-5,
+            decay_steps=60_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=60_000,
+        batch_size=128,
+        save_interval=4000,
+        keep_period=4000,
+        log_interval=100,
+    ),
+    # Same dataset and layout as pi05_tienkung_evt276_full_hand, but trained on absolute
+    # joint targets instead of arm-relative deltas.
+    #
+    # This is a separate config rather than a flag flip on the one above, because the config
+    # name is what binds a checkpoint to its transforms: assets and checkpoints are keyed on
+    # it (assets/{name}/, checkpoints/{name}/), and the real-robot client picks the transform
+    # stack by name too. Flipping the existing config in place would drop AbsoluteActions from
+    # the output stack of every checkpoint already trained under that name, which silently
+    # feeds raw deltas to the robot as if they were absolute joint targets.
+    TrainConfig(
+        name="pi05_tienkung_evt276_full_hand_abs",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=40,
+            discrete_state_input=True,
+        ),
+        data=LeRobotTienkungDataConfig(
+            repo_id="move_box_0813",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                data_root=(
+                    "/home/nvidia/datasets/EVT276_MOVE_BOX_0813/move_box_0813"
+                ),
+            ),
+            image_key="observation.images.camera_head",
+            embodiment_action_dim=24,
+            # Unused while use_delta_actions is False, but kept explicit: the field default is
+            # EVT50's "7,-1,7,-1", a 16-bit mask that would silently apply to the first 16 of
+            # these 24 action dims if the flag were ever turned back on.
+            delta_action_dims="14,-10",
+            use_delta_actions=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/media/yizi-guo/pretrained_model/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=5e-5,
+            decay_steps=60_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=60_000,
+        batch_size=128,
+        save_interval=4000,
+        keep_period=4000,
+        log_interval=100,
+    ),
+    TrainConfig(
+        name="pi05_tienkung_evt276_reduced_hand",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=40,
+            discrete_state_input=True,
+        ),
+        data=LeRobotTienkungDataConfig(
+            repo_id="evt276_move_box_to_trans_260801_reduced_hand",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                data_root=(
+                    "/media/yizi-guo/dataset/XR-1-lerobot/"
+                    "EVT276_MOVE_BOX_TO_TRANS_260801_REDUCED_HAND/"
+                    "evt276_move_box_to_trans_260801_reduced_hand"
+                ),
+            ),
+            image_key="observation.images.camera_head",
+            embodiment_action_dim=24,
+            delta_action_dims="14,-10",
+            use_delta_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/media/yizi-guo/pretrained_model/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=5e-5,
+            decay_steps=60_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=60_000,
+        batch_size=128,
+        save_interval=4000,
+        keep_period=4000,
+        log_interval=100,
     ),
     #
     # Fine-tuning Aloha configs.

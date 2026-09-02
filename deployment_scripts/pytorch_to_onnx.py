@@ -49,6 +49,10 @@ class ExportOptions:
     perf_opts: bool = True
     quantize_attention_matmul: bool = True  # FP8 only; ignored for fp16
     enable_llm_nvfp4: bool = False
+    # VLM stays FP8/NVFP4; action expert Linears + AE denoise attention stay FP16.
+    keep_ae_fp16: bool = False
+    # Only action_in_proj / action_out_proj stay FP16; gemma_expert blocks follow FP8.
+    keep_ae_proj_fp16: bool = False
 
     # --- the perf_opts bundle ---
     @property
@@ -87,6 +91,8 @@ class ExportOptions:
             f"  quantize_attention_matmul: {self.quantize_attention_matmul and precision == 'fp8'}"
             f" (fp8-only, requested={self.quantize_attention_matmul})",
             f"  enable_llm_nvfp4: {self.enable_llm_nvfp4}",
+            f"  keep_ae_fp16: {self.keep_ae_fp16}",
+            f"  keep_ae_proj_fp16: {self.keep_ae_proj_fp16}",
         ]
         return "\n".join(lines)
 
@@ -317,7 +323,12 @@ def replace_attention_with_chunked_kv(use_quantized_matmul: bool, suffix_fp16: b
     _CHUNKED_STATE["use_quantized_matmul"] = use_quantized_matmul
     _CHUNKED_STATE["suffix_fp16"] = suffix_fp16
     modeling_gemma.GemmaAttention.forward = chunked_gemma_attention_forward
-    suffix_note = "suffix matmuls in plain fp16" if suffix_fp16 and use_quantized_matmul else "suffix matmuls quantized"
+    if not use_quantized_matmul:
+        suffix_note = "all AE matmuls in plain fp16"
+    elif suffix_fp16:
+        suffix_note = "suffix matmuls in plain fp16"
+    else:
+        suffix_note = "suffix matmuls quantized"
     print(f"  Chunked AE attention ENABLED: prefix/suffix KV attended separately (cat-logits + standard softmax, {suffix_note})")
 
 
@@ -762,6 +773,16 @@ def quantize_model(
     # place would leak our overrides into any later mtq.quantize call.
     quant_cfg = copy.deepcopy(mtq.FP8_DEFAULT_CFG)
     quant_cfg["quant_cfg"]["nn.Conv2d"] = {"*": {"enable": False}}
+    if opts.keep_ae_fp16:
+        # Action projections and the action-expert transformer stay in FP16.
+        quant_cfg["quant_cfg"]["action_in_proj*"] = {"enable": False}
+        quant_cfg["quant_cfg"]["action_out_proj*"] = {"enable": False}
+        quant_cfg["quant_cfg"]["*gemma_expert*"] = {"enable": False}
+        print("  keep_ae_fp16: disabled ModelOpt quant on action_* and gemma_expert")
+    elif opts.keep_ae_proj_fp16:
+        quant_cfg["quant_cfg"]["action_in_proj*"] = {"enable": False}
+        quant_cfg["quant_cfg"]["action_out_proj*"] = {"enable": False}
+        print("  keep_ae_proj_fp16: disabled ModelOpt quant on action_in/out_proj only")
 
     if opts.fold_time_constants:
         # time_mlp / AdaRMS dense outputs depend only on the fixed denoise schedule and
@@ -820,12 +841,12 @@ def quantize_model(
         from modelopt.torch.quantization.utils import is_quantized_linear
 
         for module in quantized_model.modules():
-            assert not isinstance(module, torch.nn.Linear) or is_quantized_linear(module)
-            if isinstance(module, torch.nn.Linear):
-                module.input_quantizer._trt_high_precision_dtype = "Half"
-                module.input_quantizer._onnx_quantizer_type = "dynamic"
-                module.output_quantizer._onnx_quantizer_type = "dynamic"
-                module.weight_quantizer._onnx_quantizer_type = "static"
+            if not (isinstance(module, torch.nn.Linear) and is_quantized_linear(module)):
+                continue
+            module.input_quantizer._trt_high_precision_dtype = "Half"
+            module.input_quantizer._onnx_quantizer_type = "dynamic"
+            module.output_quantizer._onnx_quantizer_type = "dynamic"
+            module.weight_quantizer._onnx_quantizer_type = "static"
 
     return quantized_model
 
@@ -907,9 +928,12 @@ def _prepare_model_for_export(
         fuse_ae_projections(model)
 
     if opts.chunked_ae_attention:
+        # keep_ae_fp16 forces AE denoise Q@K / attn@V onto plain FP16 matmul.
+        # PaliGemma prefix attention is unchanged (eager_attention_forward).
+        use_qmm = precision == "fp8" and opts.quantize_attention_matmul and not opts.keep_ae_fp16
         replace_attention_with_chunked_kv(
-            use_quantized_matmul=(precision == "fp8" and opts.quantize_attention_matmul),
-            suffix_fp16=opts.suffix_attn_fp16,
+            use_quantized_matmul=use_qmm,
+            suffix_fp16=True if opts.keep_ae_fp16 else opts.suffix_attn_fp16,
         )
 
     if precision == "fp8":
@@ -952,6 +976,7 @@ def export_to_onnx(
     config_obj=None,
     checkpoint_dir: str = None,
     num_calibration_samples: int = 32,
+    onnx_name: str | None = None,
 ) -> torch.nn.Module:
     """Export PyTorch model to ONNX format."""
     nvfp4 = opts.enable_llm_nvfp4 and precision == "fp8"
@@ -973,7 +998,10 @@ def export_to_onnx(
 
     onnx_dir = Path(output_path) / "onnx"
     onnx_dir.mkdir(parents=True, exist_ok=True)
-    onnx_path = onnx_dir / (f"model_{precision}_nvfp4.onnx" if nvfp4 else f"model_{precision}.onnx")
+    if onnx_name:
+        onnx_path = onnx_dir / onnx_name
+    else:
+        onnx_path = onnx_dir / (f"model_{precision}_nvfp4.onnx" if nvfp4 else f"model_{precision}.onnx")
 
     print(f"\nExporting to: {onnx_path}")
 
@@ -1012,6 +1040,7 @@ def export_checkpoint_to_onnx(
     num_steps: int = 10,
     precision: str = "fp16",
     num_calibration_samples: int = 32,
+    onnx_name: str | None = None,
 ) -> torch.nn.Module:
     """Export a trained model checkpoint to ONNX format."""
     print(f"Loading model from: {checkpoint_dir}")
@@ -1033,6 +1062,7 @@ def export_checkpoint_to_onnx(
         config_obj=config,
         checkpoint_dir=checkpoint_dir,
         num_calibration_samples=num_calibration_samples,
+        onnx_name=onnx_name,
     )
 
     print(f"  ONNX model saved to: {output_path}/onnx/")
@@ -1082,12 +1112,30 @@ def main():
         default=True,
         help="QDQ nodes for attention matmul operations; only applies with --precision fp8",
     )
+    parser.add_argument(
+        "--onnx_name",
+        type=str,
+        default=None,
+        help="ONNX filename inside {output_path}/onnx/ (default: model_{precision}[_nvfp4].onnx)",
+    )
+    parser.add_argument(
+        "--keep_ae_fp16",
+        action="store_true",
+        help="Keep action-expert Linears and AE denoise attention MatMuls in FP16",
+    )
+    parser.add_argument(
+        "--keep_ae_proj_fp16",
+        action="store_true",
+        help="Keep only action_in_proj / action_out_proj in FP16; AE blocks stay FP8",
+    )
 
     args = parser.parse_args()
 
     opts = ExportOptions(
         quantize_attention_matmul=args.quantize_attention_matmul,
         enable_llm_nvfp4=args.enable_llm_nvfp4,
+        keep_ae_fp16=args.keep_ae_fp16,
+        keep_ae_proj_fp16=args.keep_ae_proj_fp16,
     )
 
     try:
@@ -1099,6 +1147,7 @@ def main():
             num_steps=args.num_steps,
             precision=args.precision,
             num_calibration_samples=args.num_calibration_samples,
+            onnx_name=args.onnx_name,
         )
     except Exception as e:
         import traceback

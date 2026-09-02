@@ -20,6 +20,7 @@ import torch
 from openpi.models_pytorch import pi0_pytorch
 from openpi.shared import image_tools
 import openpi.shared.array_typing as at
+import time
 
 logger = logging.getLogger("openpi")
 
@@ -38,8 +39,8 @@ class ModelType(enum.Enum):
 # The model always expects these images
 IMAGE_KEYS = (
     "base_0_rgb",
-    "left_wrist_0_rgb",
-    "right_wrist_0_rgb",
+#    "left_wrist_0_rgb",
+#    "right_wrist_0_rgb",
 )
 
 
@@ -240,10 +241,11 @@ class BaseModelConfig(abc.ABC):
         state.replace_by_pure_dict(params)
         return nnx.merge(graphdef, state)
 
-    def load_pytorch(self, train_config, weight_path: str):
+    def load_pytorch(self, train_config, weight_path: str, trt = False):
         logger.info(f"train_config: {train_config}")
-        model = pi0_pytorch.PI0Pytorch(config=train_config.model)
-        safetensors.torch.load_model(model, weight_path)
+        model = pi0_pytorch.PI0Pytorch(config=train_config.model, trt = trt)
+        # safetensors.torch.load_model(model, weight_path)
+        safetensors.torch.load_model(model, weight_path, strict=False)
         return model
 
     @abc.abstractmethod

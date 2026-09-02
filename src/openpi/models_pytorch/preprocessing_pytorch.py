@@ -10,8 +10,8 @@ logger = logging.getLogger("openpi")
 # Constants moved from model.py
 IMAGE_KEYS = (
     "base_0_rgb",
-    "left_wrist_0_rgb",
-    "right_wrist_0_rgb",
+#    "left_wrist_0_rgb",
+#    "right_wrist_0_rgb",
 )
 
 IMAGE_RESOLUTION = (224, 224)

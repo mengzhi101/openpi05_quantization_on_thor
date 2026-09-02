@@ -168,8 +168,10 @@ class Unnormalize(DataTransformFn):
         )
 
     def _unnormalize(self, x, stats: NormStats):
-        mean = pad_to_dim(stats.mean, x.shape[-1], axis=-1, value=0.0)
-        std = pad_to_dim(stats.std, x.shape[-1], axis=-1, value=1.0)
+        # Stats can be wider than the data when a transform truncated it to the model interface
+        # (e.g. a 34D state fitted into a 32D action_dim), so clip as well as pad.
+        mean = pad_to_dim(stats.mean, x.shape[-1], axis=-1, value=0.0)[..., : x.shape[-1]]
+        std = pad_to_dim(stats.std, x.shape[-1], axis=-1, value=1.0)[..., : x.shape[-1]]
         return x * (std + 1e-6) + mean
 
     def _unnormalize_quantile(self, x, stats: NormStats):
@@ -178,6 +180,7 @@ class Unnormalize(DataTransformFn):
         q01, q99 = stats.q01, stats.q99
         if (dim := q01.shape[-1]) < x.shape[-1]:
             return np.concatenate([(x[..., :dim] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01, x[..., dim:]], axis=-1)
+        q01, q99 = q01[..., : x.shape[-1]], q99[..., : x.shape[-1]]
         return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
 
 

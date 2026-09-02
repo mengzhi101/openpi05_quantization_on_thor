@@ -10,7 +10,6 @@ import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
-
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
     if device_type == "cpu":
@@ -82,21 +81,21 @@ def make_att_2d_masks(pad_masks, att_masks):
 
 
 class PI0Pytorch(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, trt = False):
         super().__init__()
         self.config = config
         self.pi05 = config.pi05
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
-
-        self.paligemma_with_expert = PaliGemmaWithExpertModel(
-            paligemma_config,
-            action_expert_config,
-            use_adarms=[False, True] if self.pi05 else [False, False],
-            precision=config.dtype,
-        )
-
+        print(trt)
+        if not trt:
+            self.paligemma_with_expert = PaliGemmaWithExpertModel(
+                paligemma_config,
+                action_expert_config,
+                use_adarms=[False, True] if self.pi05 else [False, False],
+                precision=config.dtype,
+            )
         self.action_in_proj = nn.Linear(config.action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.action_dim)
 

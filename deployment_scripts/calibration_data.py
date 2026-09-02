@@ -4,10 +4,10 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
 
+from decord import VideoReader, cpu
 from openpi.training import config as _config
 from openpi.policies import policy_config
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
 
 class CalibrationDataset(Dataset):
     """Dataset for FP8/NVFP4 calibration using real data samples."""
@@ -44,7 +44,8 @@ class CalibrationDataset(Dataset):
 
         print(f"  Loading {num_samples} calibration samples from dataset...")
         repo_id = config_obj.data.repo_id
-        self.lerobot_dataset = LeRobotDataset(repo_id)
+        calibration_root = "/home/nvidia/datasets/EVT276_MOVE_BOX_0813/move_box_0813"
+        self.lerobot_dataset = LeRobotDataset(repo_id, root=calibration_root)
 
         step_size = max(len(self.lerobot_dataset) // num_samples, 1)
         self.sample_indices = list(range(0, min(len(self.lerobot_dataset), num_samples * step_size), step_size))
@@ -101,13 +102,26 @@ class CalibrationDataset(Dataset):
             Tuple of (observation, noise)
         """
         data_idx = self.sample_indices[idx]
-        data = self.lerobot_dataset[data_idx]
+        # Bypass LeRobot's default TorchCodec backend. The Thor TorchCodec
+        # wheel is linked against FFmpeg 7, while this container provides
+        # FFmpeg 6. Read the parquet row directly and decode the matching RGB
+        # frame with Decord instead.
+        data = self.lerobot_dataset.hf_dataset[data_idx]
+        episode_index = int(data["episode_index"].item())
+        frame_index = int(data["frame_index"].item())
+        task_index = int(data["task_index"].item())
+        video_key = "observation.images.camera_head"
+        video_path = self.lerobot_dataset.root / self.lerobot_dataset.meta.get_video_file_path(
+            episode_index, video_key
+        )
+        video_reader = VideoReader(str(video_path), ctx=cpu(0))
+        frame_index = min(max(frame_index, 0), len(video_reader) - 1)
+        image = video_reader[frame_index].asnumpy()
 
         sample = {
-            "observation/image": data["image"],
-            "observation/wrist_image": data["wrist_image"],
-            "observation/state": data["state"],
-            "prompt": data["task"],
+            "image": image,
+            "state": data["observation.state"],
+            "prompt": self.lerobot_dataset.meta.tasks[task_index],
         }
 
         processed_data = self._process_data(sample)
@@ -170,5 +184,5 @@ def load_calibration_data(
     except Exception as e:
         print(f"  Warning: Failed to load dataset: {e}")
         print("  Falling back to dummy inputs for calibration")
+        exit()
         return None
-
