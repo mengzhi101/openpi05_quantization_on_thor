@@ -31,7 +31,7 @@ Denoise 步数在导出 ONNX 时写死，编好的 engine 不能在运行时改�
 
 ## 使用注意
 
-- **Engine 和 TensorRT 版本绑定。** 在 TensorRT 10.16 里导出的 ONNX / engine，不能直接放到 10.13 上用。部署机若是 TensorRT 10.13.3.9，请在对应容器里重新导出并编译。
+- **Engine 和 TensorRT 版本绑定。** 在 TensorRT 10.16 里导出的 ONNX / engine，不能直接放到 10.13 上用。部署机若是 TensorRT 10.13.3.9，请拉取对应版本的基础镜像，在对应容器里重新导出并编译。
 - 本仓库只含代码和文档，**不含** checkpoint、ONNX、engine 和数据集。
 - 更细的步骤和数字见 [`docs/thor_evt276_quantization.md`](docs/thor_evt276_quantization.md)。
 
